@@ -334,6 +334,9 @@ public:
     /// Get a reference to the blockchain configuration settings.
     const settings& chain_settings() const;
 
+
+
+
     struct tx_benefit {
         double benefit;
         size_t tx_sigops;
@@ -347,10 +350,55 @@ public:
 #endif
     };
 
+    inline
+    bool operator==(tx_benefit const& a, tx_benefit const& b) {
+        return a.tx_id == b.tx_id;
+    }
+
+    inline
+    bool operator!=(tx_benefit const& a, tx_benefit const& b) {
+        return !(a == b);
+    }
+
+
+
     struct prev_output {
-        libbitcoin::hash_digest output_hash;
-        uint32_t output_index;
+        libbitcoin::hash_digest hash;
+        uint32_t index;
     };
+
+    inline
+    bool operator==(prev_output const& a, prev_output const& b) {
+        return a.hash == b.hash && a.index == b.index;
+    }
+
+    inline
+    bool operator!=(prev_output const& a, prev_output const& b) {
+        return !(a == b);
+    }
+
+    inline
+    bool operator==(prev_output const& a, output_point const& b) {
+        return a.hash == b.hash() && a.index == b.index();
+    }
+
+    inline
+    bool operator!=(prev_output const& a, output_point const& b) {
+        return !(a == b);
+    }
+
+    inline
+    bool operator==(output_point const& a, prev_output const& b) {
+        return a.hash() == b.hash && a.index() == b.index;
+    }
+
+    inline
+    bool operator!=(output_point const& a, prev_output const& b) {
+        return !(a == b);
+    }
+
+    
+
 
     std::vector<block_chain::tx_benefit> get_gbt_tx_list() const;
     bool add_to_chosen_list(transaction_const_ptr tx);
@@ -424,13 +472,13 @@ private:
 
     uint64_t chosen_size_; // Size in bytes of the chosen unconfirmed transaction list
     uint64_t chosen_sigops_; // Total Amount of sigops in the chosen unconfirmed transaction list
-    std::list <tx_benefit> chosen_unconfirmed_; // Chosen unconfirmed transaction list
+    std::list<tx_benefit> chosen_unconfirmed_; // Chosen unconfirmed transaction list
     std::unordered_map<hash_digest, std::vector<prev_output>> chosen_spent_;
     mutable std::mutex gbt_mutex_; // Protect chosen unconfirmed transaction list
     std::atomic_bool gbt_ready_; // Getblocktemplate ready
 
 
-#endif
+#endif // WITH_BLOCKCHAIN_REQUESTER
 };
 
 } // namespace blockchain

@@ -300,68 +300,133 @@ void block_chain::push(transaction_const_ptr tx, dispatcher&,
 }
 
 
-//Mark every previous output of the transaction as TEMPORARY SPENT
-void block_chain::append_spend(transaction_const_ptr tx) {
-    std::vector<prev_output> prev_outputs;
-    for (auto const& input : tx->inputs()) {
-        auto const& output_point = input.previous_output();
-        prev_outputs.push_back({output_point.hash(), output_point.index()});
-    }
-    chosen_spent_.insert({tx->hash(), std::move(prev_outputs)});
 
+
+
+
+
+// ---------------------------------------------------------------------------
+// GetBlockTemplate code
+// ---------------------------------------------------------------------------
+
+// Helper function
+// Not need to be a member function, could be a free function
+prev_output block_chain::to_prev_output(chain::output_point const& output_point) const {
+    return {output_point.hash(), output_point.index()};
 }
 
+// Helper function
+// Not need to be a member function, could be a free function
+void block_chain::inputs_to_prev_outputs(chain::input::list const& inputs) const {
+    std::vector<prev_output> ret;
+    ret.reserve(inputs.size());
+    for (auto const& input : inputs) {
+        ret.push_back(to_prev_output(input.previous_output()));
+    }
+    return ret;
+}
+
+// Domain function
+//Mark every previous output of the transaction as TEMPORARY SPENT
+void block_chain::append_spend(chain::transaction const& tx) {
+    chosen_spent_.emplace(tx.hash(), inputs_to_prev_outputs(tx.inputs()));
+}
+
+
+// Domain function
 // Once a transaction was mined, every previous output that was marked
 // as TEMPORARY SPENT, needs to be removed
 // (since it was permanetly added to the spent database)
-void block_chain::remove_spend(libbitcoin::hash_digest const& hash){
+void block_chain::remove_spend(hash_digest const& hash){
     chosen_spent_.erase(hash);
 }
 
-// Search the TEMPORARY SPENT index for conflicts between previous output
-std::set<libbitcoin::hash_digest> block_chain::get_double_spend_chosen_list(transaction_const_ptr tx) {
 
-    std::set<libbitcoin::hash_digest> spent_conflict{};
-    for (auto const& input : tx->inputs()) {
-        for(auto const& spents : chosen_spent_){
-            for(auto const& previous : spents.second){
-                if(previous.output_hash == input.previous_output().hash() &&
-                    previous.output_index == input.previous_output().index())
-                {
-                    spent_conflict.insert(tx->hash());
-                }
+// Search the TEMPORARY SPENT index for conflicts between previous output
+std::set<hash_digest> block_chain::get_conflicting_tx_hashes(chain::transaction const& tx) {
+
+
+    std::set<hash_digest> spent_conflict;
+
+    // for (auto const& input : tx->inputs()) {
+    //     for(auto const& spents : chosen_spent_){
+    //         for(auto const& previous : spents.second){
+    //             if(previous.output_hash == input.previous_output().hash() &&
+    //                 previous.output_index == input.previous_output().index())
+    //             {
+    //                 spent_conflict.insert(spents.first);
+    //             }
+    //         }
+    //     }
+    // }
+
+    for (auto const& input : tx.inputs()) {
+        for (auto const& spents : chosen_spent_) {
+            auto it = std::find(begin(spents.second), end(spents.second), input.previous_output());
+            if (it != end(spents.second)) {
+                spent_conflict.insert(spents.first);
             }
         }
     }
     return spent_conflict;
 }
 
-// Search the spent database and the TEMPORARY SPENT for conflicts
-bool block_chain::check_is_double_spend(transaction_const_ptr tx){
-    bool is_double_spend = false;
-    for(auto const& input : tx->inputs()){
-        boost::latch latch(2);
-        fetch_spend(input.previous_output(), [&](const libbitcoin::code &ec, libbitcoin::chain::input_point input) {
-            if (ec == libbitcoin::error::success) {
-                is_double_spend = true;
+bool block_chain::is_double_spend_in_cache(chain::transaction const& tx) {
+    for (auto const& input : tx.inputs()) {
+        for (auto const& spents : chosen_spent_) {
+            auto it = std::find(begin(spents.second), end(spents.second), input.previous_output());
+            if (it != end(spents.second)) {
+                return true;
             }
-            latch.count_down();
-        });
-        latch.count_down_and_wait();
-
-        if(is_double_spend) return true;
+        }
     }
-    return !get_double_spend_chosen_list(tx).empty();
+    return false;
 }
 
+// Domain/Helper function
+bool block_chain::is_double_spend_in_db(chain::input const& input) {
+    bool ret = false;
+
+    boost::latch latch(2);
+    fetch_spend(input.previous_output(), [&ret](code const& ec, chain::input_point input) {
+        if (ec == error::success) {
+            ret = true;
+        }
+        latch.count_down();
+    });
+    latch.count_down_and_wait();
+
+    return ret;
+}
+
+inline
+bool block_chain::any_is_double_spend_in_db(chain::input::list const& inputs) {
+    return std::any_of(begin(inputs), end(inputs), is_double_spend_in_db));
+}
+
+// Search the spent database and the TEMPORARY SPENT for conflicts
+bool block_chain::is_double_spend(chain::transaction const& tx) {
+    if (any_is_double_spend_in_db(tx.inputs())) {
+        return true;
+    }
+    // return ! get_conflicting_tx_hashes(tx).empty();
+    return is_double_spend_in_cache(tx);
+}
+
+// Helper function
+tx_benefit block_chain::to_tx_benefit(chain::transaction const& tx) {
+#ifdef BITPRIM_CURRENCY_BCH
+    return tx_benefit{benefit, tx_sigops, tx_size, tx.fees(), tx.to_data(1), tx.hash()};
+#else
+    return tx_benefit{benefit, tx_sigops, tx_size, tx.fees(), tx.to_data(1), tx.hash(), tx.hash(true)};
+#endif
+}
 
 // Insert to chosen transaction List, ordered by the benefit yielded by the transaction
-bool block_chain::insert_to_chosen_list(transaction_const_ptr& tx, double benefit, size_t tx_size, size_t tx_sigops){
-#ifdef BITPRIM_CURRENCY_BCH
-    tx_benefit txnew{benefit, tx_sigops, tx_size, tx->fees(), tx->to_data(1), tx->hash()};
-#else
-    tx_benefit txnew{benefit, tx_sigops, tx_size, tx->fees(), tx->to_data(1), tx->hash(), tx->hash(true)};
-#endif
+bool block_chain::insert_to_chosen_list(chain::transaction const& tx, double benefit, size_t tx_size, size_t tx_sigops) {
+    //precondition: chosen_unconfirmed_, chosen_size_, chosen_sigops_ and chosen_spent_ should be protected against race conditions!
+
+    auto txnew = to_tx_benefit(tx);
     chosen_unconfirmed_.insert(
         std::upper_bound(begin(chosen_unconfirmed_), end(chosen_unconfirmed_), txnew, [](tx_benefit const& a, tx_benefit const& b) {
             return a.benefit < b.benefit;
@@ -369,20 +434,20 @@ bool block_chain::insert_to_chosen_list(transaction_const_ptr& tx, double benefi
 
     chosen_size_ += tx_size;
     chosen_sigops_ += tx_sigops;
-    append_spend(tx);
+    append_spend(tx);       //insert into chosen_spent_
 
     return true;
 }
 
 //Search how many transactions we need to remove from the transaction chosen list, if we want to add a new transaction
-size_t block_chain::find_txs_to_remove_from_chosen(const size_t sigops_limit, const size_t tx_size,
-        const size_t tx_sigops, const size_t tx_fees, const double benefit,
-            size_t& acum_sigops, size_t& acum_size, double& acum_benefit)
+size_t block_chain::find_txs_to_remove_from_chosen(size_t sigops_limit, size_t tx_size,
+    size_t tx_sigops, size_t tx_fees, double benefit,
+    size_t& acum_sigops, size_t& acum_size, double& acum_benefit)
 {
     // How many transactions should I remove, while still gaining more benefit
-    acum_benefit += (*chosen_unconfirmed_.begin()).benefit;
-    acum_sigops += (*chosen_unconfirmed_.begin()).tx_sigops;
-    acum_size += (*chosen_unconfirmed_.begin()).tx_size;
+    acum_benefit += chosen_unconfirmed_.front().benefit;
+    acum_sigops += chosen_unconfirmed_.front().tx_sigops;
+    acum_size += chosen_unconfirmed_.front().tx_size;
 
     size_t removed = 0;
     auto max_block_size = libbitcoin::get_max_block_size() - libbitcoin::coinbase_reserved_size;
@@ -410,41 +475,41 @@ bool block_chain::add_to_chosen_list(transaction_const_ptr tx){
     std::lock_guard<std::mutex> lock(gbt_mutex_);
 
     //Dont allow dependencies
-    for(auto const& input : tx->inputs())
-        if(chosen_spent_.find(input.previous_output().hash()) != chosen_spent_.end())
+    for (auto const& input : tx->inputs()) {
+        if (chosen_spent_.find(input.previous_output().hash()) != chosen_spent_.end()) {
             return false;
+        }
+    }
 
     //If is not double spend
-    if (!check_is_double_spend(tx)){
+    if ( ! is_double_spend(*tx)) {
         auto tx_size = tx->serialized_size(0);
         auto tx_sigops = tx->signature_operations();
         auto tx_fees = tx->fees();
 
         auto estimated_size = chosen_size_ + tx_size;
         auto max_block_size = libbitcoin::get_max_block_size() - libbitcoin::coinbase_reserved_size;
-        auto next_size = (estimated_size > max_block_size)? max_block_size : (estimated_size);
+        auto next_size = (std::min)(estimated_size, max_block_size);
         auto sigops_limit = (size_t(next_size / libbitcoin::one_million_bytes_block) + 1) * libbitcoin::sigops_per_million_bytes;
-        double benefit = (double(tx_fees) / tx_size );
+        auto benefit = double(tx_fees) / tx_size;
 
         // Check if the transaction can be added directly to the chosen transaction list
-        if (((chosen_sigops_ + tx_sigops) > sigops_limit) || (estimated_size > max_block_size)){
+        if (((chosen_sigops_ + tx_sigops) > sigops_limit) || (estimated_size > max_block_size)) {
             size_t acum_sigops = 0;
             size_t acum_size = 0;
-            double acum_benefit = 0;
+            double acum_benefit = 0.0;
 
             size_t txs_to_remove_from_list = find_txs_to_remove_from_chosen(sigops_limit, tx_size, tx_sigops, tx_fees, benefit,
                 acum_sigops, acum_size, acum_benefit);
 
-            if(txs_to_remove_from_list != 0)
-            {
+            if (txs_to_remove_from_list != 0) {
                 // Remove transactions
                 chosen_sigops_ -= acum_sigops;
                 chosen_size_ -= acum_size;
-                while(txs_to_remove_from_list != 0)
-                {
-                    remove_spend((*chosen_unconfirmed_.begin()).tx_id);
+                while (txs_to_remove_from_list != 0) {
+                    remove_spend(chosen_unconfirmed_.front().tx_id);
                     chosen_unconfirmed_.pop_front();
-                    txs_to_remove_from_list--;
+                    --txs_to_remove_from_list;
                 }
                 // Add the new transaction ordered by benefit
                 insert_to_chosen_list(tx, benefit, tx_size, tx_sigops);
@@ -459,67 +524,62 @@ bool block_chain::add_to_chosen_list(transaction_const_ptr tx){
     return true;
 } 
 
-std::vector<block_chain::tx_benefit> block_chain::get_gbt_tx_list() const{
-    if (stopped()) {
-        return std::vector<block_chain::tx_benefit>();
-    }
-
-    if (!gbt_ready_) {
-        return std::vector<block_chain::tx_benefit>();
+std::vector<tx_benefit> block_chain::get_gbt_tx_list() const {
+    if (stopped() || ! gbt_ready_) {
+        return {}; //std::vector<tx_benefit>();
     }
 
     std::lock_guard<std::mutex> lock(gbt_mutex_);
-    std::vector<tx_benefit> txs_chosen_list{ std::begin(chosen_unconfirmed_), std::end(chosen_unconfirmed_) };
+    // return std::vector<tx_benefit>(begin(chosen_unconfirmed_), end(chosen_unconfirmed_));
+    return {begin(chosen_unconfirmed_), end(chosen_unconfirmed_)};
+}
 
-    return txs_chosen_list;
+bool block_chain::remove_tx_blabla(hash_digest const& hash) {
+    if (chosen_unconfirmed_.erase(hash) > 0)) {
+        remove_spend(hash);
+        return true;
+    }
+    return false;
+}
+
+void block_chain::remove_conflicting_txs(chain::transaction const& tx) {
+    for (auto const& conflict_hash : get_conflicting_tx_hashes(tx)) {
+        remove_tx_blabla(conflict_hash);
+    }
 }
 
 
 //When a new block arrives, we need to check every transaction on the chosen list
 //to see if it was mined; and remove it if it was.
 //using tx_benefit = std::tuple<double /*benefit*/, size_t /*tx_sigops*/, size_t /*tx_size*/, size_t /*tx_fees*/, libbitcoin::data_chunk /*tx_hex*/, libbitcoin::hash_digest /*tx_hash */> ;
-bool block_chain::remove_mined_txs_from_chosen_list(block_const_ptr blk){
+bool block_chain::remove_mined_and_conflicting_txs_from_chosen_list(block_const_ptr blk) {
 
-    gbt_ready_= false;
+    gbt_ready_= false;  //TODO(fernando): what happend if a GBT is called before this... ()
     std::lock_guard<std::mutex> lock(gbt_mutex_);
-    for(auto const& tx : blk->transactions()){
-        //erase transactions by hash
-        auto it = std::find_if (chosen_unconfirmed_.begin(), chosen_unconfirmed_.end(),
-            [&](const tx_benefit& tx_chosen){
-                return tx_chosen.tx_id == tx.hash();
-              });
-        if(it != chosen_unconfirmed_.end()){
-          //If transaction was deleted by hash, remove spended outputs
-          remove_spend(tx.hash());
-          chosen_unconfirmed_.erase(it);
-        } else {
-            //If the tx mined hash wasnt on our chosen list
-            //There may be another transaction wich uses the same prev output as this tx. (double spend attempt) 
-            //This should be extremely rare
-            libbitcoin::message::transaction msg_tx {tx};
-            transaction_const_ptr msg_ptr = std::make_shared<const libbitcoin::message::transaction>(msg_tx);
-            for(auto const& conflict_hash : get_double_spend_chosen_list(msg_ptr)){
-                auto conflict = std::find_if (chosen_unconfirmed_.begin(), chosen_unconfirmed_.end(),
-                [&](const tx_benefit& tx_chosen){
-                    return (tx_chosen.tx_id == conflict_hash);
-                  });
-                if(conflict != chosen_unconfirmed_.end()){
-                    chosen_unconfirmed_.erase(conflict);
-                    remove_spend(conflict_hash); //Do it on get_souble_spend_mempool
-                }
-            }
+
+    for (auto const& tx : blk->transactions()) {
+        if (! remove_tx_blabla(tx.hash())) {
+            remove_conflicting_txs(tx);
         }
     }
 
+    //TODO(fernando): could be done when removing
     chosen_size_ = 0;
     chosen_sigops_ = 0;
-    for(auto const& tx : chosen_unconfirmed_ ){
+    for (auto const& tx : chosen_unconfirmed_) {
         chosen_sigops_ += tx.tx_sigops;
         chosen_size_ += tx.tx_size;
     }
-    gbt_ready_ = true;
 
+    gbt_ready_ = true;  //TODO(Fernando): should be signalized after releasing the mutex?
 }
+
+// ---------------------------------------------------------------------------
+// GetBlockTemplate code (END)
+// ---------------------------------------------------------------------------
+
+
+
 
 void block_chain::fetch_unconfirmed_transaction(const hash_digest& hash, 
     transaction_unconfirmed_fetch_handler handler) const
@@ -541,8 +601,6 @@ void block_chain::fetch_unconfirmed_transaction(const hash_digest& hash,
     const auto tx = std::make_shared<const transaction>(result.transaction());
     handler(error::success, tx);
 }
-
-
 
 void block_chain::reorganize(const checkpoint& fork_point,
     block_const_ptr_list_const_ptr incoming_blocks,
